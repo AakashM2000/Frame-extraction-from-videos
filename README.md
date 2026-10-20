@@ -1,8 +1,6 @@
 # Blade coating: CVAT → U-Net → video measurements
 
-A standalone Python project for **offline** blade-coating analysis. It replaces the submitted scripts' dependency on the spin-coater `image_segmentation` package. It does not contain a trained blade-coating model. Train it on your reviewed annotations first.
-
-Start with a fixed, focused camera and stable illumination. For film thickness and meniscus curvature, use a calibrated side view that resolves the liquid interfaces. A top view supports segmentation and in-plane motion, but does not reveal film thickness.
+A standalone Python project for **offline** blade-coating analysis. It does not contain a trained blade-coating model. Train it on your reviewed annotations first.
 
 ## 1. Install on Windows
 
