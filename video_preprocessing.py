@@ -1,4 +1,4 @@
-"""Sample native-resolution frames using video presentation timestamps."""
+
 import argparse,csv,hashlib,json,math,re
 from pathlib import Path
 import numpy as np
@@ -14,7 +14,7 @@ def frames(path, fps_override=None, time_scale=1.0):
         start=None; previous=None
         for i,f in enumerate(container.decode(stream)):
             if fps_override:
-                t=i/fps_override; source='explicit_cfr'
+                t=i/fps_override; source='explicit_cfr' # cfr - constant frame rate
             elif f.pts is not None and f.time_base is not None:
                 t=float(f.pts*f.time_base); source='pts'
             else: raise ValueError('Missing timestamps. Supply --fps only if true constant capture FPS is known')
@@ -43,7 +43,7 @@ def main():
         paths.extend(sorted(x for x in q.rglob('*') if x.suffix.lower() in extensions) if q.is_dir() else [q])
     paths=sorted(set(x.resolve() for x in paths))
     if not paths: raise ValueError('No videos found')
-    with (out/'manifest.csv').open('w',newline='') as f:
+    with (out/'images.csv').open('w',newline='') as f:
         writer=csv.DictWriter(f,fieldnames=['file','video_id','frame_idx','time_s','time_source','video_path','width','height'])
         writer.writeheader()
         for path in paths:
@@ -57,4 +57,4 @@ def main():
                 count+=1; next_t=t+a.every_sec
             print(path.name, count, 'frames')
     (out/'extraction.json').write_text(json.dumps(vars(a),indent=2))
-if __name__=='__main__': main()
+if __name__=='__main__': main() # This file runs directly by using main() function
