@@ -1,0 +1,157 @@
+# Blade coating: CVAT → U-Net → video measurements
+
+A standalone Python project for **offline** blade-coating analysis. It replaces the submitted scripts' dependency on the spin-coater `image_segmentation` package. It does not contain a trained blade-coating model. Train it on your reviewed annotations first.
+
+Start with a fixed, focused camera and stable illumination. For film thickness and meniscus curvature, use a calibrated side view that resolves the liquid interfaces. A top view supports segmentation and in-plane motion, but does not reveal film thickness.
+
+## 1. Install on Windows
+
+Extract this ZIP, open `blade_coating_project` in VS Code, and open its terminal. Use Python 3.11 or 3.12. These PowerShell commands do not require activating the environment:
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install -e .
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+If you have Python 3.11, change the first command to `py -3.11`. All following examples use `python`; on Windows replace it with `.venv\Scripts\python.exe`, or select that interpreter in VS Code and activate its terminal. A supported NVIDIA GPU speeds training; CPU works but is slower. Consult the [official PyTorch installer](https://pytorch.org/get-started/locally/) if your installation does not detect your GPU.
+
+For Colab, upload/unzip this project, change directory to its root, and run `%pip install -e .`. Run the command examples in cells with `!python`. The interactive ROI selector needs a desktop; in Colab edit the supplied JSON template manually. Keep data and checkpoints in persistent storage before ending a Colab session.
+
+## 2. Extract annotation images
+
+Place two independent recording runs at `videos/runA.mp4` and `videos/runB.mp4`. More independent runs, coating conditions, lighting conditions, and start/stop examples are preferable. Do not divide copies or adjacent frames from one recording into different run groups.
+
+```bash
+python -m blade_coating_segmentation.video_preprocessing --videos videos/runA.mp4 --out frames/runA --every-sec 0.5
+python -m blade_coating_segmentation.video_preprocessing --videos videos/runB.mp4 --out frames/runB --every-sec 0.5
+```
+
+This keeps original image dimensions and produces PNG images plus `manifest.csv` with timestamps. Upload the PNGs to CVAT. Do not resize annotation images. Use a new output folder for each extraction. The interval is a starting point: review coverage and include transient/rare cases rather than thousands of nearly identical frames.
+
+The default time source is video presentation timestamps (PTS). These can represent playback time rather than real process time in slow-motion recordings. If a known constant acquisition frame rate is more appropriate, supply `--fps 100`, for example. Never invent a frame rate.
+
+## 3. Annotate and export from CVAT
+
+Use polygons or masks to describe visible regions, with these labels:
+
+| CVAT label | Model ID | Meaning |
+|---|---:|---|
+| background | 0 | Air and everything outside the three foreground classes |
+| substrate | 1 | Visible substrate |
+| coating | 2 | Visible wet liquid, including the meniscus/bridge and deposited film |
+| tool | 3 | Blade/tool |
+| ignore, optional | 255 | Ambiguous pixels excluded from training/evaluation |
+
+`wet film`, `wet_film`, `liquid`, and `meniscus` are accepted aliases for `coating`; `blade` is accepted for `tool`. Keeping one liquid class is deliberate: a wet-film-only annotation would omit the meniscus needed for curvature estimation.
+
+Classes are mutually exclusive. Draw the visible liquid region where its boundary is identifiable; do not invent hidden liquid beneath the tool or invisible thickness inside transparent regions. Review overlap ordering so the exported semantic mask has the intended visible label. Background is often implicit black in the export. Unannotated foreground is **not** a legitimate negative example. Use `ignore` for ambiguous regions and exclude incomplete frames.
+
+Export each task as **Segmentation Mask**, then unzip into `annotations/runA` or `annotations/runB`. Expected contents include:
+
+```text
+annotations/runA/labelmap.txt
+annotations/runA/SegmentationClass/<matching-image-stem>.png
+```
+
+The code reads label names and RGB colors from `labelmap.txt`, not label order. Paletted and RGB PNG masks are supported. Unpaletted grayscale/index masks are rejected because their class meanings cannot safely be guessed. Unknown labels/colors cause an error. Use the original extracted PNG directory for images if the export omits them. See the [official CVAT format documentation](https://docs.cvat.ai/docs/dataset_management/formats/format-smask/).
+
+Create `reviewed_A.txt` and `reviewed_B.txt`, each with one **actual image filename per line**, listing only frames you have fully annotated and checked. A fully reviewed background-only frame belongs in the list. Preserve the unique filenames generated by extraction. Do not put illustrative filenames into these lists.
+
+```bash
+python -m blade_coating_segmentation.dataset --export annotations/runA --images frames/runA --reviewed reviewed_A.txt --group runA --out data/runA.json
+python -m blade_coating_segmentation.dataset --export annotations/runB --images frames/runB --reviewed reviewed_B.txt --group runB --out data/runB.json
+```
+
+These create canonical ID masks and image/mask manifests, with hashes. Each group must represent an independent acquisition run, not an arbitrary task/chunk. If a run spans multiple CVAT tasks, keep the same group. Manifests contain absolute paths: regenerate them after moving data between machines. If preparation fails partway, inspect the cause and use a fresh output manifest name (the mask cache may already exist).
+
+## 4. Train U-Net
+
+```bash
+python -m blade_coating_segmentation.train --data data/runA.json data/runB.json --val-groups runB --out runs/unet --epochs 80 --batch-size 2 --crop 384 512
+```
+
+This trains a four-class U-Net from scratch with cross-entropy + Dice loss, optional automatic class weighting, native-scale crops, brightness/contrast augmentation, early stopping, and learning-rate reduction. `--channels 1` enables grayscale; the default is RGB. Every target class must have training pixels. Batch size may exceed the number of training frames without silently producing zero updates.
+
+Validation holds out whole runs. It uses full native frames, so large images may require significant GPU memory. Reduce `--base` to 16 and batch size for training memory; validation remains batch size one. CPU (`--device cpu`) is a fallback for full-frame validation. Inference is tiled, but validation is not. Do not shrink only masks or stretch axes to solve memory issues.
+
+Outputs: `best.pt`, `last.pt`, `history.json` with per-class IoU, `confusion_matrix.json`, `split.json`, and `run.json`. Inspect foreground IoUs and overlay quality, not only average IoU. Reserve an additional untouched test run for final assessment after choosing settings.
+
+Resume the same experiment with the same data/settings:
+
+```bash
+python -m blade_coating_segmentation.train --data data/runA.json data/runB.json --val-groups runB --out runs/unet --epochs 120 --batch-size 2 --crop 384 512 --resume runs/unet/last.pt
+```
+
+The dataset hashes, split, and core settings must match. Resume in the same output folder so its existing `best.pt` remains available. The code restores optimizer/scheduler/scaler and random states; exact cross-device/version reproducibility is not promised. Old spin-coater or jakeret checkpoints are incompatible with this new architecture and class definition.
+
+## 5. Configure measurements on the actual analysis video
+
+```bash
+python -m blade_coating_segmentation.configure --video videos/runC.mp4 --out calibration.json
+```
+
+Click two opposite corners for each requested region. Close a figure to skip that measurement. Choose textured **rigid** tool and substrate/stage features that remain visible for the whole analysis. A highlight or liquid boundary is not a rigid motion marker. Select separate regions around each visible meniscus free surface and a flat film region away from the meniscus. If only one meniscus is visible, enable only that one.
+
+Alternatively, copy `configs/measurement_template.json` to `calibration.json` and edit it. Its dimensions are examples, not your video dimensions. ROI syntax is `[x, y, width, height]`, with origin at the top left. All coordinates refer to the original image. Set `image_size` to the actual `[width,height]`. There are no coordinates tied to the earlier 917×330 image.
+
+Key settings:
+
+| Setting | Meaning |
+|---|---|
+| `view` | `side`, `top`, or `unknown` |
+| `mm_per_pixel` | Known in-plane distance in mm divided by its pixel length; `null` leaves physical values unavailable |
+| `uniform_scale_confirmed` | Set true only for a view with appropriate uniform scale at the measured interfaces/features |
+| `motion_axis` | Direction of coating travel in the image, e.g. `[1,0]`; normalized internally |
+| `tool_template_roi` / `substrate_template_roi` | Initial rigid feature patches; independently tracked across frames |
+| `stationary_substrate_confirmed` | Needed when tracking only the tool: both substrate and camera must be stationary |
+| `left_meniscus_roi` / `right_meniscus_roi` | Fixed search regions enclosing one liquid-air arc each |
+| `film_roi` | Flat liquid layer, including background above and substrate below |
+| `film_interfaces_confirmed` | Both relevant interfaces are independently visible |
+| `horizontal_substrate_confirmed` | Side-view substrate is horizontal, so vertical distances measure thickness |
+| `time_scale` | Actual elapsed time = video elapsed time × this factor |
+
+For example, 100 fps capture encoded at 25 fps creates a four-times slower playback: use `time_scale: 0.25`, or override with `--fps 100` and leave `time_scale: 1`. Do not apply both corrections. PyAV's timestamp basis is documented [here](https://pyav.org/docs/stable/api/time.html).
+
+Perspective, refraction, lens distortion, camera rotation, and depth differences are **not automatically corrected**. A single scalar calibration is appropriate only when its scale applies to the measurement plane. If rectification is needed, perform it consistently before extracting training images and analyzing videos, then recalibrate. Tool and substrate features at different depths can have different scales; this implementation does not solve that case.
+
+## 6. Analyze a video
+
+```bash
+python -m blade_coating_segmentation.inference --checkpoint runs/unet/best.pt --input videos/runC.mp4 --config calibration.json --out results/runC --save-masks
+```
+
+Use a new/empty output directory. Native-resolution tiled inference avoids stretching the image. `--tile 512 --overlap 64` controls memory and blending. The default analyzes every decoded frame; frame skipping (`--every`) can damage motion tracking and derivatives, so start with every frame.
+
+Results:
+
+| Output | Contents |
+|---|---|
+| `measurements.csv` | Time, class area fractions, motion estimates, radii, thickness and quality statuses |
+| `preview.mp4` | Segmentation overlay, selected interfaces/ROIs, fitted arcs; fixed-rate visual preview only |
+| `first_overlay.png` | First-frame overlay for inspection |
+| `masks/` | Optional original-size PNG masks with IDs 0–3 |
+| `analysis_config.json`, `provenance.json` | Settings used for the analysis |
+
+The preview's playback FPS does not define measurement time. Use `time_s` in the CSV. Unavailable/rejected values are empty, not zero.
+
+## How to interpret measurements
+
+**Speed and acceleration:** Normalized cross-correlation tracks user-selected rigid patches. The tool's displacement relative to the substrate is projected onto `motion_axis`. Signed velocity is its time derivative; speed is its magnitude; acceleration is the signed derivative of velocity. A centered quadratic fit uses actual timestamps, with a default nine-frame window. No fit bridges invalid positions or long gaps; the first/last four samples of each valid segment have no derivative. Set `max_gap_s` above your normal analyzed-frame spacing, and tune the window against real dynamics. These centered estimates use future frames and are not a real-time controller. Relative image translation can cancel common camera translation when both features share suitable geometry; it cannot cancel rotation/perspective changes. A uniformly smooth moving substrate needs a marker, encoder, or other motion reference.
+
+**Meniscus radius:** Fits a robust circle to each selected visible liquid-air arc, excluding nearby solid contacts. Outputs an approximate **2D fitted radius of curvature**, not bridge half-width, droplet radius, contact angle, or 3D curvature. Short arcs, inadequate points, large residuals and excessive radius are rejected. Inspect `left/right_rmse_px`, `span_deg`, statuses and overlays. A noncircular interface may need a different local-curvature method. ROIs are fixed in image coordinates; cover the arc's motion without including another free interface. The largest connected liquid/interface component is used, so disconnected droplets or ambiguous regions need narrower ROIs and manual review.
+
+**Wet-film thickness:** Reports the median contiguous liquid-layer height across valid columns in the flat side-view ROI. Each column must have visible background above, coating, and substrate below. The defaults require at least three pixels and enough valid columns; those are screening rules, not proof of optical resolution. `p10/p90` describe spatial variation, not statistical confidence intervals. A top-view footprint, apparent color, blade gap, or meniscus height is not film thickness. If the actual layer is unresolved, report it unavailable and use suitable microscopy/interferometry or an independent gauge.
+
+**Calibration and uncertainty:** Physical outputs use mm, mm/s and mm/s² only with a valid scale. Otherwise use px, px/s and px/s². At a minimum, compare tracked displacement with an encoder/known travel, curvature with manually checked arcs, and thickness with an independent measurement. Boundary error of a few pixels can dominate a thin film. Thresholds and neural-network confidence scores are heuristic and not calibrated uncertainty estimates.
+
+## Files and troubleshooting
+
+See `REVIEW.md` for changes from the submitted code and `TEST_REPORT.md` for actual checks. Python modules are under `blade_coating_segmentation/`.
+
+- Import error: install this project with the same Python interpreter that runs it.
+- Unknown mask color/label: check the CVAT labelmap and lossless export, rather than changing IDs by guesswork.
+- Blank speed: inspect `tracking_status` and `kinematics_status`; check texture, frame spacing, motion reference and window length.
+- Blank radius/thickness: inspect view, calibration/visibility settings, ROIs, segmentation and quality status. Do not relax thresholds simply to force a number.
+- No real accuracy result is claimed: no blade-coating video, calibrated scene or reviewed dataset was available for this implementation.
